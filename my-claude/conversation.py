@@ -1,19 +1,24 @@
 """
-对话循环（对应原版 src/query.ts）
+对话循环（对应原版 src/query.ts + src/QueryEngine.ts）
 
 核心流程：
   用户输入
+    → 斜杠命令？→ 分发给 commands/
     → 发送给 Claude（携带工具定义 + 系统上下文）
     → Claude 返回文本 或 tool_use 块
-    → 如果是 tool_use：权限检查 → 执行工具 → 把结果作为 tool_result 发回给 Claude
-    → 重复直到 Claude 返回纯文本（stop_reason == "end_turn"）
+    → 如果是 tool_use：权限检查 → 执行工具 → 返回 tool_result → 继续循环
+    → 更新 token 用量，检查是否需要自动压缩
+    → 自动保存会话
 """
 
 import anthropic
 
 import config
 import permissions
+from commands import dispatch as dispatch_command
 from context import build_system_prompt
+from services.compact import should_compact, compact_messages
+from services.session import save_session, new_session_id
 from tools import TOOL_REGISTRY, get_api_tools
 from ui import repl
 from ui.diff_view import print_diff
@@ -21,33 +26,42 @@ from ui.diff_view import print_diff
 
 def run_conversation():
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    messages = []
+
+    state = {
+        "messages": [],
+        "client": client,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "session_id": new_session_id(),
+    }
+    messages = state["messages"]
 
     repl.print_welcome(config.DEFAULT_MODEL)
 
-    # 对话开始时构建一次系统上下文（CLAUDE.md + git status）
     system_prompt = build_system_prompt()
 
     while True:
         user_input = repl.get_user_input()
 
         if user_input is None:
+            _autosave(state)
             print("\nBye.")
             break
         if user_input.lower() in ("exit", "quit"):
+            _autosave(state)
             print("Bye.")
             break
         if not user_input:
             continue
 
-        # 处理斜杠命令（阶段三会独立为 commands/ 模块）
         if user_input.startswith("/"):
-            _handle_slash_command(user_input)
+            handled = dispatch_command(user_input, state)
+            if not handled:
+                repl.print_error(f"未知命令: {user_input}。输入 /help 查看可用命令。")
             continue
 
         messages.append({"role": "user", "content": user_input})
 
-        # 工具调用循环：一次对话可能包含多轮 tool_use → tool_result
         while True:
             try:
                 response = client.messages.create(
@@ -63,6 +77,9 @@ def run_conversation():
             except anthropic.APIConnectionError as e:
                 repl.print_error(f"Connection error: {e}")
                 break
+
+            state["input_tokens"] += response.usage.input_tokens
+            state["output_tokens"] += response.usage.output_tokens
 
             messages.append({"role": "assistant", "content": response.content})
 
@@ -95,10 +112,7 @@ def run_conversation():
                 if fn is None:
                     result = f"[error] Unknown tool: {tool_name}"
                 else:
-                    if tool_name == "file_edit":
-                        result = _run_file_edit_with_diff(fn, tool_input)
-                    else:
-                        result = fn(tool_input)
+                    result = _run_tool(fn, tool_name, tool_input)
 
                 repl.print_tool_result(result)
                 tool_results.append({
@@ -109,9 +123,17 @@ def run_conversation():
 
             messages.append({"role": "user", "content": tool_results})
 
+        _check_auto_compact(state, client)
+        _autosave(state)
+
+
+def _run_tool(fn, tool_name: str, tool_input: dict) -> str:
+    if tool_name == "file_edit":
+        return _run_file_edit_with_diff(fn, tool_input)
+    return fn(tool_input)
+
 
 def _run_file_edit_with_diff(fn, tool_input: dict) -> str:
-    """执行 file_edit 并在执行后展示 diff"""
     import os
     path = tool_input.get("path", "")
     old_string = tool_input.get("old_string", "")
@@ -134,25 +156,28 @@ def _run_file_edit_with_diff(fn, tool_input: dict) -> str:
     return result
 
 
-def _handle_slash_command(command: str) -> None:
-    """简易斜杠命令处理（阶段三会扩展为完整的 commands/ 模块）"""
-    cmd = command.strip().lower()
-    if cmd in ("/help", "/?"):
-        print("\n可用命令：")
-        print("  /help        显示此帮助")
-        print("  /mode        查看当前权限模式")
-        print("  /mode plan   切换到 plan 模式（所有工具都询问）")
-        print("  /mode bypass 切换到 bypass 模式（跳过所有询问）")
-        print("  /mode default 切换到默认模式")
-        print("  exit / quit  退出\n")
-    elif cmd == "/mode":
-        print(f"当前权限模式：{permissions.get_mode()}")
-    elif cmd.startswith("/mode "):
-        mode = cmd.split(" ", 1)[1].strip()
+def _check_auto_compact(state: dict, client: anthropic.Anthropic) -> None:
+    """
+    检查 token 用量，超阈值时自动压缩。
+    对应原版 isAutoCompactEnabled() + compactConversation()
+    """
+    if should_compact(state["input_tokens"], config.DEFAULT_MODEL):
+        messages = state["messages"]
+        print(f"\n[auto-compact] token 用量达到阈值 ({state['input_tokens']:,})，正在压缩...")
         try:
-            permissions.set_mode(mode)
-            print(f"权限模式已切换为：{mode}")
-        except ValueError as e:
-            repl.print_error(str(e))
-    else:
-        repl.print_error(f"未知命令：{command}。输入 /help 查看可用命令。")
+            new_messages = compact_messages(client, messages)
+            state["messages"][:] = new_messages
+            state["input_tokens"] = 0
+            state["output_tokens"] = 0
+            print(f"[auto-compact] 压缩完成，消息从 {len(messages)} 条 → {len(new_messages)} 条")
+        except Exception as e:
+            print(f"[auto-compact] 压缩失败: {e}")
+
+
+def _autosave(state: dict) -> None:
+    if not state["messages"]:
+        return
+    try:
+        save_session(state["messages"], state["session_id"])
+    except Exception:
+        pass
