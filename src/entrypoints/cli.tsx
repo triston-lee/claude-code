@@ -17,6 +17,26 @@ if (typeof globalThis.MACRO === "undefined") {
 (globalThis as any).BUILD_ENV = "production";
 (globalThis as any).INTERFACE_TYPE = "stdio";
 
+const loadEnvFile = (process as typeof process & {
+    loadEnvFile?: (path?: string) => void;
+}).loadEnvFile;
+if (typeof loadEnvFile === "function") {
+    try {
+        loadEnvFile();
+    } catch (error) {
+        if (
+            !(
+                typeof error === "object" &&
+                error !== null &&
+                "code" in error &&
+                error.code === "ENOENT"
+            )
+        ) {
+            throw error;
+        }
+    }
+}
+
 // Bugfix for corepack auto-pinning, which adds yarnpkg to peoples' package.jsons
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 process.env.COREPACK_ENABLE_AUTO_PIN = "0";
