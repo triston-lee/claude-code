@@ -4,20 +4,20 @@
 核心流程：
   用户输入
     → 斜杠命令？→ 分发给 commands/
-    → 发送给 Claude（携带工具定义 + 系统上下文）
-    → Claude 返回文本 或 tool_use 块
-    → 如果是 tool_use：权限检查 → 执行工具 → 返回 tool_result → 继续循环
+    → 通过 provider 发送给 Claude（携带工具定义 + 系统上下文）
+    → 流式输出文本 + 累积 tool_use 块
+    → 如果有 tool_use：权限检查 → 执行工具 → 返回 tool_result → 继续循环
     → 更新 token 用量，检查是否需要自动压缩
     → 自动保存会话
 """
-
-import anthropic
 
 import config
 import permissions
 from commands import dispatch as dispatch_command
 from context import build_system_prompt
-from services.compact import should_compact, compact_messages
+from providers import get_provider
+from providers.base import ContentBlock, StreamResult
+from services.compact import should_compact, compact_messages_via_provider
 from services.session import save_session, new_session_id
 from tools import TOOL_REGISTRY, get_api_tools
 from ui import repl
@@ -25,11 +25,11 @@ from ui.diff_view import print_diff
 
 
 def run_conversation():
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    provider = get_provider()
 
     state = {
         "messages": [],
-        "client": client,
+        "provider": provider,
         "input_tokens": 0,
         "output_tokens": 0,
         "session_id": new_session_id(),
@@ -37,6 +37,7 @@ def run_conversation():
     messages = state["messages"]
 
     repl.print_welcome(config.DEFAULT_MODEL)
+    repl.print_provider(provider.name)
 
     system_prompt = build_system_prompt()
 
@@ -64,31 +65,20 @@ def run_conversation():
 
         while True:
             try:
-                response = client.messages.create(
-                    model=config.DEFAULT_MODEL,
-                    max_tokens=config.MAX_TOKENS,
-                    system=system_prompt,
-                    tools=get_api_tools(),
-                    messages=messages,
-                )
-            except anthropic.APIStatusError as e:
+                result = _stream_response(provider, system_prompt, messages, state)
+            except Exception as e:
                 repl.print_error(str(e))
                 break
-            except anthropic.APIConnectionError as e:
-                repl.print_error(f"Connection error: {e}")
-                break
 
-            state["input_tokens"] += response.usage.input_tokens
-            state["output_tokens"] += response.usage.output_tokens
+            # 把 ContentBlock dataclass 转回 messages 需要的格式
+            messages.append({
+                "role": "assistant",
+                "content": _blocks_to_api_format(result.content),
+            })
 
-            messages.append({"role": "assistant", "content": response.content})
-
-            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+            tool_use_blocks = [b for b in result.content if b.type == "tool_use"]
 
             if not tool_use_blocks:
-                for block in response.content:
-                    if block.type == "text" and block.text:
-                        repl.print_assistant_message(block.text)
                 break
 
             tool_results = []
@@ -99,32 +89,90 @@ def run_conversation():
                 repl.print_tool_call(tool_name, tool_input)
 
                 if not permissions.check_permission(tool_name, tool_input):
-                    result = "[permission denied by user]"
-                    repl.print_tool_result(result)
+                    result_str = "[permission denied by user]"
+                    repl.print_tool_result(result_str)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use.id,
-                        "content": result,
+                        "content": result_str,
                     })
                     continue
 
                 fn = TOOL_REGISTRY.get(tool_name)
                 if fn is None:
-                    result = f"[error] Unknown tool: {tool_name}"
+                    result_str = f"[error] Unknown tool: {tool_name}"
                 else:
-                    result = _run_tool(fn, tool_name, tool_input)
+                    result_str = _run_tool(fn, tool_name, tool_input)
 
-                repl.print_tool_result(result)
+                repl.print_tool_result(result_str)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use.id,
-                    "content": result,
+                    "content": result_str,
                 })
 
             messages.append({"role": "user", "content": tool_results})
 
-        _check_auto_compact(state, client)
+        _check_auto_compact(state)
         _autosave(state)
+
+
+def _blocks_to_api_format(blocks: list[ContentBlock]) -> list[dict]:
+    """把统一 ContentBlock 转回 API messages 格式"""
+    result = []
+    for b in blocks:
+        if b.type == "text":
+            result.append({"type": "text", "text": b.text})
+        elif b.type == "tool_use":
+            result.append({
+                "type": "tool_use",
+                "id": b.id,
+                "name": b.name,
+                "input": b.input,
+            })
+    return result
+
+
+def _stream_response(
+    provider,
+    system_prompt: str,
+    messages: list,
+    state: dict,
+) -> StreamResult:
+    """
+    使用 provider 的流式 API 调用 Claude，逐 token 打印文本。
+    返回统一的 StreamResult。
+    """
+    collected_text = ""
+    has_text = False
+
+    gen = provider.stream(
+        model=config.DEFAULT_MODEL,
+        max_tokens=config.MAX_TOKENS,
+        system=system_prompt,
+        tools=get_api_tools(),
+        messages=messages,
+    )
+
+    try:
+        while True:
+            event = next(gen)
+            if event.type == "text_delta" and event.text:
+                if not has_text:
+                    repl.start_assistant_stream()
+                    has_text = True
+                repl.stream_text(event.text)
+                collected_text += event.text
+    except StopIteration as e:
+        result = e.value
+
+    if has_text:
+        repl.finish_assistant_stream(collected_text)
+
+    state["input_tokens"] += result.usage.input_tokens
+    state["output_tokens"] += result.usage.output_tokens
+
+    return result
 
 
 def _run_tool(fn, tool_name: str, tool_input: dict) -> str:
@@ -156,16 +204,13 @@ def _run_file_edit_with_diff(fn, tool_input: dict) -> str:
     return result
 
 
-def _check_auto_compact(state: dict, client: anthropic.Anthropic) -> None:
-    """
-    检查 token 用量，超阈值时自动压缩。
-    对应原版 isAutoCompactEnabled() + compactConversation()
-    """
+def _check_auto_compact(state: dict) -> None:
     if should_compact(state["input_tokens"], config.DEFAULT_MODEL):
         messages = state["messages"]
+        provider = state["provider"]
         print(f"\n[auto-compact] token 用量达到阈值 ({state['input_tokens']:,})，正在压缩...")
         try:
-            new_messages = compact_messages(client, messages)
+            new_messages = compact_messages_via_provider(provider, messages)
             state["messages"][:] = new_messages
             state["input_tokens"] = 0
             state["output_tokens"] = 0

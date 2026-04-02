@@ -2,18 +2,25 @@
 终端 UI 输出（对应原版 src/screens/REPL.tsx + src/components/）
 
 原版用 React/Ink 渲染，这里用 rich 库提供格式化输出：
-  - Claude 回复：渲染 Markdown
+  - Claude 回复：流式逐 token 打印，结束后渲染完整 Markdown
   - 工具调用：显示工具名和参数摘要
   - 错误：红色提示
 """
 
+import sys
+
+_console = None
+
 
 def _get_console():
-    try:
-        from rich.console import Console
-        return Console()
-    except ImportError:
-        return None
+    global _console
+    if _console is None:
+        try:
+            from rich.console import Console
+            _console = Console()
+        except ImportError:
+            pass
+    return _console
 
 
 def print_welcome(model: str) -> None:
@@ -26,8 +33,47 @@ def print_welcome(model: str) -> None:
         print("输入 'exit' 或 Ctrl+C 退出\n")
 
 
+def print_provider(provider_name: str) -> None:
+    """显示当前使用的 provider"""
+    if provider_name != "anthropic":
+        console = _get_console()
+        if console:
+            console.print(f"  [dim]provider: {provider_name}[/dim]")
+        else:
+            print(f"  provider: {provider_name}")
+
+
+# ── Streaming output ──────────────────────────────────────────────
+
+def start_assistant_stream() -> None:
+    """流式输出开始前调用，打印标题行"""
+    console = _get_console()
+    if console:
+        console.print("\n[bold green]Claude[/bold green]", end=" ")
+    else:
+        print("\nClaude: ", end="")
+    sys.stdout.flush()
+
+
+def stream_text(chunk: str) -> None:
+    """逐 token 打印文本（原始文本，不做 Markdown 渲染）"""
+    sys.stdout.write(chunk)
+    sys.stdout.flush()
+
+
+def finish_assistant_stream(full_text: str) -> None:
+    """
+    流式输出结束后调用。
+    换行、然后用 rich Markdown 重新渲染完整回复（覆盖原始流式输出）。
+    如果终端不支持 rich，直接换行即可（原始文本已经打印过了）。
+    """
+    # 流式输出后加一个空行收尾
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def print_assistant_message(text: str) -> None:
-    """渲染 Claude 的文本回复（支持 Markdown）"""
+    """渲染 Claude 的文本回复（支持 Markdown）— 非流式时使用"""
     console = _get_console()
     if console:
         from rich.markdown import Markdown
@@ -37,6 +83,8 @@ def print_assistant_message(text: str) -> None:
     else:
         print(f"\nClaude: {text}\n")
 
+
+# ── Tool output ───────────────────────────────────────────────────
 
 def print_tool_call(tool_name: str, tool_input: dict) -> None:
     """显示工具调用信息"""
@@ -75,6 +123,8 @@ def print_tool_result(result: str) -> None:
     else:
         print(f"  → {preview}")
 
+
+# ── Misc ──────────────────────────────────────────────────────────
 
 def print_error(message: str) -> None:
     console = _get_console()

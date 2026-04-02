@@ -70,6 +70,7 @@ def compact_messages(client: anthropic.Anthropic, messages: list) -> list:
     """
     调用 Claude 压缩对话历史，返回新的 messages 列表（只含摘要）。
     对应原版 compactConversation()
+    保留兼容旧代码的版本。
     """
     conversation_text = _messages_to_text(messages)
 
@@ -91,6 +92,38 @@ def compact_messages(client: anthropic.Anthropic, messages: list) -> list:
             raw_summary = block.text
             break
 
+    return _build_summary_messages(raw_summary)
+
+
+def compact_messages_via_provider(provider, messages: list) -> list:
+    """
+    通过 provider 抽象层压缩对话历史。
+    conversation.py 现在使用这个版本。
+    """
+    conversation_text = _messages_to_text(messages)
+
+    result = provider.create(
+        model=config.DEFAULT_MODEL,
+        max_tokens=8096,
+        system=COMPACT_SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"{COMPACT_USER_PROMPT}\n\n<conversation>\n{conversation_text}\n</conversation>",
+            }
+        ],
+    )
+
+    raw_summary = ""
+    for block in result.content:
+        if block.type == "text":
+            raw_summary = block.text
+            break
+
+    return _build_summary_messages(raw_summary)
+
+
+def _build_summary_messages(raw_summary: str) -> list:
     formatted = _format_summary(raw_summary)
 
     summary_message = (
