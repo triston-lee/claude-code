@@ -1321,3 +1321,336 @@ class ClaudeApp(App):
 | buddy/sprites.py | src/buddy/sprites.ts | ~500 |
 | buddy/soul.py | src/buddy/prompt.ts | 37 |
 | ui/app.py | src/screens/REPL.tsx + src/ink/ | ~4000+ |
+
+---
+
+## 补充模块：配置系统（Config System）
+
+### 原版文件
+- src/utils/config.ts（GlobalConfig + ProjectConfig，800+ 行）
+- src/utils/settings/settings.ts（Settings 文件读写）
+- src/utils/settings/constants.ts（SettingSource 定义）
+- src/bootstrap/state.ts（会话级全局单例）
+
+### 关键区分：GlobalConfig vs Settings
+
+⚠️ 原版有两套独立的配置概念，很容易混淆：
+
+| | GlobalConfig | Settings |
+|-|-------------|---------|
+| 文件 | ~/.claude/config.json | ~/.claude/settings.json 等 |
+| 用途 | 用户身份 + 持久偏好 | 行为配置（hooks/permissions/mcpServers）|
+| 结构 | 单一 JSON 文件 | 多层合并（5 个来源）|
+| 写入 | saveGlobalConfig() | updateSettingsForSource() |
+| 典型内容 | userID, oauthAccount, companion, theme | hooks, permissions, env, mcpServers |
+
+### Settings 文件层次结构（5 个来源）
+
+```typescript
+// constants.ts
+export const SETTING_SOURCES = [
+  'userSettings',    // ~/.claude/settings.json（用户级，共享）
+  'projectSettings', // .claude/settings.json（项目级，提交到 git）
+  'localSettings',   // .claude/settings.local.json（本地覆盖，gitignore）
+  'flagSettings',    // --settings /path/to/settings.json（CLI 参数）
+  'policySettings',  // managed-settings.json（企业管理员下发）
+] as const
+```
+
+优先级：**policySettings > flagSettings > localSettings > projectSettings > userSettings**
+
+后加载的来源覆盖前面的值（高优先级赢）。
+
+文件路径映射：
+```
+userSettings    → ~/.claude/settings.json
+projectSettings → {cwd}/.claude/settings.json
+localSettings   → {cwd}/.claude/settings.local.json
+flagSettings    → 由 --settings 指定的路径
+policySettings  → {os_managed_path}/managed-settings.json
+```
+
+注：localSettings 是给 .gitignore 的本地覆盖，不应提交到版本控制。
+
+### GlobalConfig 关键字段
+
+```typescript
+type GlobalConfig = {
+  userID?: string               // 用于 Buddy 生成的种子
+  oauthAccount?: AccountInfo    // OAuth 账号信息
+  companion?: StoredCompanion   // Buddy 灵魂（name + personality）
+  autoCompactEnabled: boolean   // 是否启用自动压缩
+  theme: ThemeSetting           // UI 主题
+  primaryApiKey?: string        // OAuth 授权后的 API key
+  env: Record<string, string>   // 环境变量（@deprecated，用 settings.env）
+  mcpServers?: Record<string, McpServerConfig>  // 用户级 MCP 服务器
+  numStartups: number           // 启动次数（用于首次体验引导）
+  verbose: boolean              // 详细日志
+  editorMode?: 'emacs' | 'vim' // 编辑器模式
+  bypassPermissionsModeAccepted?: boolean
+  showTurnDuration: boolean     // 是否显示每轮耗时
+  diffTool?: 'terminal' | 'vscode'
+}
+```
+
+### bootstrap/state.ts — 会话全局单例
+
+```typescript
+// 注释：DO NOT ADD MORE STATE HERE - BE JUDICIOUS WITH GLOBAL STATE
+type State = {
+  sessionId: SessionId      // UUID，每次启动生成
+  originalCwd: string       // 启动时的工作目录（永不改变）
+  projectRoot: string       // 项目根目录（worktree 时保持主项目路径）
+  cwd: string               // 当前工作目录（worktree 时会变化）
+  totalCostUSD: number      // 本次会话累计花费
+  modelUsage: {...}         // 各模型 token 用量
+  isInteractive: boolean    // 是否交互模式（vs pipe 模式）
+  startTime: number         // 会话开始时间戳
+  lastInteractionTime: number
+  totalLinesAdded: number   // 代码变更统计
+  totalLinesRemoved: number
+}
+```
+
+originalCwd vs cwd vs projectRoot 的区别：
+- `originalCwd`：启动时固定，用于解析 settings.json 路径
+- `projectRoot`：项目标识，用于历史/会话关联（worktree 时仍指向主仓库）
+- `cwd`：当前操作目录，EnterWorktreeTool 后会更新
+
+### Python 实现目标
+
+```python
+# config_system/global_config.py
+import json
+import os
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+def get_claude_config_dir() -> Path:
+    """对应 getClaudeConfigHomeDir()"""
+    return Path(os.environ.get('CLAUDE_CONFIG_DIR',
+                               Path.home() / '.claude'))
+
+def get_config_file() -> Path:
+    return get_claude_config_dir() / 'config.json'
+
+@dataclass
+class GlobalConfig:
+    user_id: str | None = None
+    oauth_account: dict | None = None
+    companion: dict | None = None      # StoredCompanion
+    auto_compact_enabled: bool = True
+    theme: str = 'dark'
+    primary_api_key: str | None = None
+    num_startups: int = 0
+    verbose: bool = False
+    show_turn_duration: bool = False
+
+def load_global_config() -> GlobalConfig:
+    path = get_config_file()
+    if not path.exists():
+        return GlobalConfig()
+    data = json.loads(path.read_text())
+    return GlobalConfig(
+        user_id=data.get('userID'),
+        oauth_account=data.get('oauthAccount'),
+        companion=data.get('companion'),
+        auto_compact_enabled=data.get('autoCompactEnabled', True),
+        theme=data.get('theme', 'dark'),
+        primary_api_key=data.get('primaryApiKey'),
+        num_startups=data.get('numStartups', 0),
+        verbose=data.get('verbose', False),
+        show_turn_duration=data.get('showTurnDuration', False),
+    )
+
+def save_global_config(config: GlobalConfig) -> None:
+    path = get_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {k: v for k, v in asdict(config).items() if v is not None}
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+# config_system/settings.py
+SETTING_SOURCES = ['userSettings', 'projectSettings', 'localSettings',
+                   'flagSettings', 'policySettings']
+
+def get_settings_path(source: str, cwd: str = None) -> Path | None:
+    cwd = Path(cwd or os.getcwd())
+    match source:
+        case 'userSettings':
+            return get_claude_config_dir() / 'settings.json'
+        case 'projectSettings':
+            return cwd / '.claude' / 'settings.json'
+        case 'localSettings':
+            return cwd / '.claude' / 'settings.local.json'
+        case _:
+            return None
+
+def load_merged_settings(cwd: str = None) -> dict:
+    """按优先级合并所有 settings（低优先级先加载，高优先级覆盖）"""
+    merged = {}
+    for source in SETTING_SOURCES:
+        path = get_settings_path(source, cwd)
+        if path and path.exists():
+            try:
+                data = json.loads(path.read_text())
+                deep_merge(merged, data)
+            except json.JSONDecodeError:
+                pass
+    return merged
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """深度合并，override 优先"""
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+```
+
+---
+
+## 补充模块：State 管理
+
+### 原版两层状态
+
+**层 1：bootstrap/state.ts（模块级单例）**
+- 会话粒度的全局变量
+- 进程启动时初始化，整个会话共享
+- 用 getter/setter 函数访问（非响应式）
+- 内容：sessionId, originalCwd, totalCostUSD, modelUsage
+
+**层 2：AppState + Zustand store（React 响应式状态）**
+- UI 粒度的响应式状态
+- 内容：messages, tools, permissionContext, mcpClients
+- 每次更新触发 React re-render
+- 子 Agent 有独立的 AppState 副本（或 no-op setter）
+
+```typescript
+// AppState 核心字段（src/state/AppState.tsx）
+type AppState = {
+  messages: Message[]
+  tools: Tools
+  toolPermissionContext: ToolPermissionContext
+  mcpClients: MCPServerConnection[]
+  verbose: boolean
+  isLoading: boolean
+  inProgressToolUseIDs: Set<string>
+  hasInterruptibleToolInProgress: boolean
+  // ... 更多 UI 状态
+}
+```
+
+**设计决策**：两层分离的原因：
+- bootstrap 状态需要在工具执行、hook、API 调用等非 React 上下文中访问
+- AppState 只在 React 组件树中流通，保持 UI 更新的精确性
+- 如果把会话统计放进 React state，每次 token 增加都会触发全局重渲染
+
+### Python 对应
+
+```python
+# bootstrap/state.py — 模块级单例（对应 bootstrap/state.ts）
+import uuid
+import time
+from dataclasses import dataclass, field
+
+@dataclass
+class SessionState:
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    original_cwd: str = field(default_factory=lambda: os.getcwd())
+    project_root: str = field(default_factory=lambda: os.getcwd())
+    cwd: str = field(default_factory=lambda: os.getcwd())
+    start_time: float = field(default_factory=time.time)
+    total_cost_usd: float = 0.0
+    total_lines_added: int = 0
+    total_lines_removed: int = 0
+    is_interactive: bool = True
+    model_usage: dict = field(default_factory=dict)  # model -> {input, output, cost}
+
+# 模块级单例（整个进程共享）
+_session: SessionState | None = None
+
+def get_session() -> SessionState:
+    global _session
+    if _session is None:
+        _session = SessionState()
+    return _session
+
+def reset_session() -> SessionState:
+    global _session
+    _session = SessionState()
+    return _session
+```
+
+---
+
+## 补充模块：Context 构建（System Prompt 组装）
+
+### 原版文件
+- src/context.ts（189 行核心，另有大量辅助）
+
+### 系统提示的组成
+
+Claude 收到的 system prompt 由多个部分拼装：
+
+```
+1. [固定前缀] CLI sysprompt prefix（版本号、基础指令）
+2. [内存文件] ~/.claude/CLAUDE.md（用户全局记忆）
+3. [项目文件] 从 cwd 向上遍历的 CLAUDE.md 文件
+4. [Git 状态] 当前分支、最近提交、文件变更
+5. [时间] 今天的日期
+6. [工具列表] 可用工具的描述（通过 prompt() 方法）
+7. [Buddy] Companion 介绍文本（如果启用）
+```
+
+CLAUDE.md 文件发现规则：
+- 从 cwd 开始，向上遍历目录树
+- 遇到 .git 目录停止
+- 支持 @path/to/other.md 语法引用其他文件（安全验证后内联）
+- 路径必须在项目根目录内（防路径遍历）
+
+### Python 实现现状
+
+```python
+# my-claude/context.py — 当前实现（已完成基础版）
+def build_system_prompt() -> str:
+    parts = []
+    parts.append(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}")
+    parts.append(f"Working directory: {os.getcwd()}")
+    
+    # CLAUDE.md 文件（已实现）
+    claude_md = _find_claude_md_files()
+    for path, content in claude_md:
+        parts.append(f"# Instructions from {path}\n{content}")
+    
+    # Git 状态（已实现）
+    git_info = _get_git_info()
+    if git_info:
+        parts.append(git_info)
+    
+    return "\n\n".join(parts)
+```
+
+待补充：
+- `@import` 语法支持（内联引用其他 markdown 文件）
+- 安全验证（防止引用项目外文件）
+- 内存文件（~/.claude/CLAUDE.md）
+
+---
+
+## 实施路线图（最终版）
+
+| 阶段 | 模块 | 状态 | 关键文件 | 原版参考 |
+|------|------|------|---------|---------|
+| A | SSE 流式输出 + httpx 客户端 | ✅ 已完成 | core/ | claude.ts |
+| B | Hook 系统（27事件/4类型）| 待实现 | services/hooks.py | hooks.ts |
+| C | 权限规则引擎 | 待实现 | permissions/rule_engine.py | permissions/*.ts |
+| D | 工具基类重构 | 待实现 | tools/base.py | Tool.ts |
+| E | 压缩策略扩展（micro+降级链）| 待实现 | services/compact_v2.py | compact/*.ts |
+| F | 配置系统（GlobalConfig+Settings）| 待实现 | config_system/ | config.ts + settings/ |
+| G | Bootstrap State 单例 | 待实现 | bootstrap/state.py | bootstrap/state.ts |
+| H | Buddy 系统 | 待实现 | buddy/ | buddy/ |
+| I | asyncio 并发工具执行 | 待实现 | core/tool_orchestrator.py | StreamingToolExecutor.ts |
+| J | MCP 协议 | 待实现 | services/mcp/ | services/mcp/ |
+| K | 多 Agent 协调 | 待实现 | tools/agent_tool.py | AgentTool/ |
+| L | Textual TUI（可选）| 可选 | ui/app.py | REPL.tsx + ink/ |
