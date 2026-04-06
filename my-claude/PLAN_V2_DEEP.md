@@ -1654,3 +1654,1087 @@ def build_system_prompt() -> str:
 | J | MCP 协议 | 待实现 | services/mcp/ | services/mcp/ |
 | K | 多 Agent 协调 | 待实现 | tools/agent_tool.py | AgentTool/ |
 | L | Textual TUI（可选）| 可选 | ui/app.py | REPL.tsx + ink/ |
+
+
+---
+
+## 附录：全仓库能力模块覆盖审计
+
+> 本节基于对原始 TypeScript 代码库的系统性行数审计，补充 PLAN_V2_DEEP.md 尚未覆盖的所有能力模块。
+
+### 覆盖矩阵总览
+
+| 模块目录 | 行数 | 计划覆盖状态 | 优先级 |
+|---------|------|------------|-------|
+| utils/ | ~181,000 | 部分覆盖（permissions、settings、config 已覆盖）| 高 |
+| components/ | ~82,000 | 未覆盖（TUI 阶段 L 简化处理）| 中 |
+| tools/ | ~51,000 | 已覆盖（56 个工具，阶段 D）| 高 |
+| bridge/ | ~12,622 | **未覆盖**（IDE 集成）| 中 |
+| utils/bash/ | ~12,310 | **未覆盖**（Bash AST 安全分析）| 高 |
+| screens/ | ~9,000 | 未覆盖（TUI 屏幕层）| 中 |
+| utils/swarm/ | ~7,548 | **未覆盖**（Swarm 多 Agent 协调）| 高 |
+| services/ | ~6,000+ | 部分覆盖（MCP、compact 已覆盖）| 高 |
+| cli/ | ~5,604 | **未覆盖**（SDK/print 模式）| 中 |
+| utils/messages.ts | ~5,556 | **未覆盖**（消息格式化核心）| 高 |
+| utils/sessionStorage.ts | ~5,106 | **未覆盖**（会话持久化）| 高 |
+| skills/ | ~4,080 | **未覆盖**（技能系统）| 高 |
+| utils/attachments.ts | ~3,999 | **未覆盖**（附件系统）| 中 |
+| tasks/ | ~3,317 | **未覆盖**（7 种后台任务类型）| 高 |
+| keybindings/ | ~3,168 | **未覆盖**（按键绑定系统）| 低 |
+| services/oauth/ | ~1,077 | **未覆盖**（OAuth 2.0 认证）| 中 |
+| services/SessionMemory/ | ~1,026 | **未覆盖**（会话记忆）| 高 |
+| coordinator/ | ~373 | **未覆盖**（协调器模式）| 低 |
+
+---
+
+## 补充模块 S1：Bash AST 安全分析系统
+
+**原始路径**：（~12,310 行）
+
+### 核心组成
+
+| 文件 | 功能 |
+|------|------|
+|  | tree-sitter AST 解析，提取安全相关结构 |
+|  | Bash 命令解析器主入口 |
+|  | AST 节点类型定义 |
+|  | 低层解析原语 |
+|  | 命令识别与分类 |
+|  | Shell 补全分析 |
+|  /  | 引号处理和转义 |
+|  | heredoc 语法解析 |
+|  /  | 命令前缀分析 |
+|  | 命令注册表 |
+|  | 核心安全分析 |
+
+### TreeSitterAnalysis 数据结构
+
+{ is a shell keyword
+
+### Python 实现设计
+
+', fully_unquoted):
+        compound.has_subshell = True
+    if re.search(r'\{[^}]+\}', fully_unquoted):
+        compound.has_command_group = True
+    
+    # Dangerous patterns
+    dangerous = DangerousPatterns()
+    if re.search(r'\$\(|]+
+
+**实施阶段**：Phase D（工具基类重构）时配套实现，BashTool 的安全验证依赖此模块。
+
+
+---
+
+## 补充模块 S1：Bash AST 安全分析系统
+
+**原始路径**：`src/utils/bash/`（~12,310 行）
+
+### 核心组成
+
+| 文件 | 功能 |
+|------|------|
+| `treeSitterAnalysis.ts` | tree-sitter AST 解析，提取安全相关结构 |
+| `bashParser.ts` | Bash 命令解析器主入口 |
+| `ast.ts` | AST 节点类型定义 |
+| `commands.ts` | 命令识别与分类 |
+| `shellQuote.ts` / `shellQuoting.ts` | 引号处理和转义 |
+| `heredoc.ts` | heredoc 语法解析 |
+| `registry.ts` | 命令注册表 |
+
+### 关键数据结构
+
+原版使用 tree-sitter NAPI 原生模块解析 Bash AST，提取三类信息：
+
+1. **QuoteContext**：去除引号内容后的命令文本（三种变体），用于判断命令是否处于安全引号上下文中
+2. **CompoundStructure**：复合命令结构（&&、||、;、管道、子shell、命令组）
+3. **DangerousPatterns**：危险模式检测（命令替换 `$()`、进程替换 `<()`、参数展开 `${}`、heredoc、注释）
+
+### Python 实现计划
+
+```python
+# my-claude/utils/bash_analysis.py
+# 纯 Python 正则实现（原版用 tree-sitter NAPI，精度更高）
+
+from dataclasses import dataclass, field
+
+@dataclass
+class QuoteContext:
+    with_double_quotes: str      # 去除单引号内容
+    fully_unquoted: str          # 去除所有引号内容
+    unquoted_keep_quote_chars: str
+
+@dataclass
+class CompoundStructure:
+    has_compound_operators: bool = False  # &&, ||, ;
+    has_pipeline: bool = False
+    has_subshell: bool = False            # $() 或反引号
+    has_command_group: bool = False       # {...}
+    operators: list = field(default_factory=list)
+    segments: list = field(default_factory=list)
+
+@dataclass
+class DangerousPatterns:
+    has_command_substitution: bool = False  # $() 或反引号
+    has_process_substitution: bool = False  # <() 或 >()
+    has_parameter_expansion: bool = False   # ${...}
+    has_heredoc: bool = False
+    has_comment: bool = False
+
+@dataclass
+class BashAnalysis:
+    quote_context: QuoteContext
+    compound_structure: CompoundStructure
+    dangerous_patterns: DangerousPatterns
+
+def analyze_bash_command(cmd: str) -> BashAnalysis:
+    """近似实现，用于安全验证。"""
+    import re
+    uq = re.sub(r"'[^']*'|"[^"]*"", '', cmd)
+    quote_ctx = QuoteContext(
+        with_double_quotes=re.sub(r"'[^']*'", '', cmd),
+        fully_unquoted=uq,
+        unquoted_keep_quote_chars=re.sub(r"'[^']*'|"[^"]*"", '""', cmd),
+    )
+    compound = CompoundStructure(
+        has_compound_operators=bool(re.search(r'&&|[|][|]|;', uq)),
+        has_pipeline=bool(re.search(r'[|]', uq)),
+        has_subshell=bool(re.search(r'[$][(]|`', uq)),
+        has_command_group=bool(re.search(r'[{][^}]+[}]', uq)),
+    )
+    dangerous = DangerousPatterns(
+        has_command_substitution=bool(re.search(r'[$][(]|`[^`]+`', uq)),
+        has_process_substitution=bool(re.search(r'[<>][(]', uq)),
+        has_parameter_expansion=bool(re.search(r'[$][{]', uq)),
+        has_heredoc=bool(re.search(r'<<', uq)),
+        has_comment=bool(re.search(r'#', uq)),
+    )
+    return BashAnalysis(quote_ctx, compound, dangerous)
+```
+
+**实施阶段**：Phase D（工具基类）时配套实现，供 BashTool 安全验证使用。
+
+
+---
+
+## 补充模块 S2：Tasks 后台任务系统
+
+**原始路径**：`src/tasks/`（~3,317 行）
+
+### 7 种任务类型
+
+| 类型 | 文件 | 用途 |
+|------|------|------|
+| `LocalShellTask` | `LocalShellTask/` | 本地 shell 命令后台执行 |
+| `LocalAgentTask` | `LocalAgentTask/` | 本地 Claude agent 子任务 |
+| `RemoteAgentTask` | `RemoteAgentTask/` | 远程（Bridge）agent 任务 |
+| `InProcessTeammateTask` | `InProcessTeammateTask/` | 进程内队友任务（Swarm）|
+| `LocalWorkflowTask` | `LocalWorkflowTask/` | 本地工作流任务 |
+| `MonitorMcpTask` | `MonitorMcpTask/` | 监控 MCP 服务器任务 |
+| `DreamTask` | `DreamTask/` | Dream 模式任务（feature flag 关闭）|
+
+### 任务状态机
+
+```typescript
+// 原版 types.ts
+type TaskState =
+  | LocalShellTaskState
+  | LocalAgentTaskState
+  | RemoteAgentTaskState
+  | InProcessTeammateTaskState
+  | LocalWorkflowTaskState
+  | MonitorMcpTaskState
+  | DreamTaskState
+
+// 后台任务判断条件：
+// 1. status === 'running' 或 'pending'
+// 2. isBackgrounded !== false
+function isBackgroundTask(task: TaskState): boolean
+```
+
+### Python 实现设计
+
+```python
+# my-claude/tasks/types.py
+from enum import Enum
+from dataclasses import dataclass
+from typing import Literal, Union
+
+class TaskStatus(str, Enum):
+    PENDING = 'pending'
+    RUNNING = 'running'
+    DONE = 'done'
+    ERROR = 'error'
+    CANCELLED = 'cancelled'
+
+@dataclass
+class BaseTaskState:
+    task_id: str
+    status: TaskStatus
+    is_backgrounded: bool = True
+    created_at: float = 0.0
+
+@dataclass
+class LocalShellTaskState(BaseTaskState):
+    type: Literal['local_shell'] = 'local_shell'
+    command: str = ''
+    pid: int | None = None
+    output: str = ''
+    exit_code: int | None = None
+
+@dataclass
+class LocalAgentTaskState(BaseTaskState):
+    type: Literal['local_agent'] = 'local_agent'
+    prompt: str = ''
+    session_id: str = ''
+    messages: list = None
+
+TaskState = Union[
+    LocalShellTaskState,
+    LocalAgentTaskState,
+    # ... 其他类型
+]
+
+def is_background_task(task: BaseTaskState) -> bool:
+    if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING):
+        return False
+    if hasattr(task, 'is_backgrounded') and task.is_backgrounded is False:
+        return False
+    return True
+```
+
+**实施阶段**：Phase K（多 Agent 协调）时实现基础任务类型，Swarm 阶段扩展 InProcessTeammateTask。
+
+---
+
+## 补充模块 S3：Skills 技能系统
+
+**原始路径**：`src/skills/`（~4,080 行）
+
+### 核心概念
+
+Skills（技能）是用户自定义的斜杠命令（slash commands），以 Markdown 文件形式存储：
+
+- **存储位置**：
+  - `~/.claude/skills/` — 用户全局技能
+  - `<project>/.claude/skills/` — 项目级技能
+  - Plugin 提供的技能
+  - MCP 服务器注册的技能
+  - 内置（bundled）技能
+
+- **文件格式**：Markdown 文件，支持 frontmatter：
+
+```markdown
+---
+description: 执行 git commit 并推送
+allowed-tools: Bash
+argument-hint: <message>
+model: claude-opus-4-5
+effort: high
+---
+执行以下操作：
+1. git add -A
+2. git commit -m "$ARGUMENTS"  
+3. git push
+```
+
+### Frontmatter 字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `description` | string | 命令描述 |
+| `allowed-tools` | string/list | 允许使用的工具列表 |
+| `argument-hint` | string | 参数提示（显示在补全中）|
+| `model` | string | 覆盖默认模型 |
+| `effort` | low/medium/high | 努力等级（影响 token budget）|
+| `shell` | string | 执行 shell（bash/zsh 等）|
+
+### LoadedFrom 来源标识
+
+```typescript
+type LoadedFrom =
+  | 'commands_DEPRECATED'  // 旧版 commands/ 目录
+  | 'skills'               // 新版 skills/ 目录
+  | 'plugin'               // 插件提供
+  | 'managed'              // 管理员策略
+  | 'bundled'              // 内置技能
+  | 'mcp'                  // MCP 服务器注册
+```
+
+### Python 实现设计
+
+```python
+# my-claude/skills/loader.py
+from pathlib import Path
+from dataclasses import dataclass
+import yaml, re
+
+@dataclass
+class SkillFrontmatter:
+    description: str = ''
+    allowed_tools: list[str] = None
+    argument_hint: str = ''
+    model: str | None = None
+    effort: str = 'medium'  # low/medium/high
+    shell: str = 'bash'
+
+@dataclass
+class LoadedSkill:
+    name: str           # 斜杠命令名（文件名去掉 .md）
+    content: str        # Markdown 主体内容
+    frontmatter: SkillFrontmatter
+    loaded_from: str    # 'skills'/'bundled'/'plugin'/'mcp'
+    source_path: Path
+
+def load_skills_dir(directory: Path, loaded_from: str = 'skills') -> list[LoadedSkill]:
+    skills = []
+    for md_file in sorted(directory.glob('**/*.md')):
+        name = md_file.stem
+        text = md_file.read_text(encoding='utf-8')
+        fm, body = parse_frontmatter(text)
+        skills.append(LoadedSkill(
+            name=name,
+            content=body,
+            frontmatter=fm,
+            loaded_from=loaded_from,
+            source_path=md_file,
+        ))
+    return skills
+
+def get_skills_paths() -> list[tuple[Path, str]]:
+    """返回所有技能目录及其来源标识。"""
+    import os
+    home = Path.home()
+    cwd = Path.cwd()
+    paths = []
+    # 用户全局
+    paths.append((home / '.claude' / 'skills', 'skills'))
+    # 项目级（从 cwd 到 home）
+    for d in [cwd] + list(cwd.parents):
+        p = d / '.claude' / 'skills'
+        if p.exists():
+            paths.append((p, 'skills'))
+        if d == home:
+            break
+    return paths
+```
+
+**实施阶段**：Phase F（配置系统）时实现基础加载，Phase L（TUI）时集成到斜杠命令补全。
+
+
+---
+
+## 补充模块 S4：Session Memory 会话记忆
+
+**原始路径**：`src/services/SessionMemory/`（~1,026 行）
+
+### 功能概述
+
+Session Memory 是一个持久化的会话笔记系统：
+- 在会话结束时，由模型自动更新会话摘要文件
+- 文件路径：`~/.claude/session_memory/<session_id>.md`
+- 在新会话开始时，将摘要注入到系统提示中，实现跨会话记忆
+
+### 关键常量
+
+```typescript
+// src/services/SessionMemory/sessionMemory.ts
+const MAX_SECTION_LENGTH = 2000        // 每个 section 最大 token 数
+const MAX_TOTAL_SESSION_MEMORY_TOKENS = 12000  // 总会话记忆最大 token 数
+```
+
+### 会话记忆模板
+
+原版有 10 个固定 section（不可增删）：
+
+1. **Session Title** — 5-10 词的描述性标题
+2. **Current State** — 当前正在做什么，待完成的任务
+3. **Task specification** — 用户要求构建什么
+4. **Files and Functions** — 重要文件及其作用
+5. **Workflow** — 常用 bash 命令及执行顺序
+6. **Errors & Corrections** — 遇到的错误及修复方法
+7. **Codebase and System Documentation** — 系统组件说明
+8. **Learnings** — 什么有效，什么无效
+9. **Key results** — 用户要求的具体输出结果
+10. **Worklog** — 逐步操作记录（简洁）
+
+### 更新机制
+
+```typescript
+// 会话结束时，发送一条特殊消息给模型：
+// "Based on the user conversation above, update the session notes file."
+// 模型调用 Edit 工具更新笔记文件，然后停止
+// 更新规则：
+// - 只更新每个 section 的内容，不修改 header 和斜体描述行
+// - section 接近 MAX_SECTION_LENGTH 时，精简旧内容
+// - 并行调用多个 Edit 工具更新多个 section
+```
+
+### Python 实现设计
+
+```python
+# my-claude/services/session_memory.py
+from pathlib import Path
+from dataclasses import dataclass
+
+MAX_SECTION_LENGTH = 2000
+MAX_TOTAL_SESSION_MEMORY_TOKENS = 12000
+
+SESSION_MEMORY_TEMPLATE = """# Session Title
+_A short and distinctive 5-10 word descriptive title_
+
+# Current State
+_What is actively being worked on right now?_
+
+# Task specification
+_What did the user ask to build?_
+
+# Files and Functions
+_What are the important files and why are they relevant?_
+
+# Workflow
+_What bash commands are usually run and in what order?_
+
+# Errors & Corrections
+_Errors encountered and how they were fixed._
+
+# Codebase and System Documentation
+_What are the important system components?_
+
+# Learnings
+_What has worked well? What has not?_
+
+# Key results
+_Exact output the user requested._
+
+# Worklog
+_Step by step, what was attempted, done?_
+"""
+
+def get_session_memory_path(session_id: str) -> Path:
+    home = Path.home()
+    return home / '.claude' / 'session_memory' / f'{session_id}.md'
+
+def load_session_memory(session_id: str) -> str | None:
+    path = get_session_memory_path(session_id)
+    if path.exists():
+        return path.read_text(encoding='utf-8')
+    return None
+
+def init_session_memory(session_id: str) -> Path:
+    path = get_session_memory_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(SESSION_MEMORY_TEMPLATE, encoding='utf-8')
+    return path
+
+def build_memory_update_prompt(notes_path: Path, current_notes: str) -> str:
+    return (
+        f"Based on the conversation above, update the session notes file.\n"
+        f"File: {notes_path}\n"
+        f"Current contents:\n{current_notes}\n\n"
+        f"Use the Edit tool to update relevant sections. "
+        f"Preserve all section headers and italic description lines exactly. "
+        f"Only update content below each italic description."
+    )
+```
+
+**实施阶段**：Phase G（Bootstrap State）完成后实现，作为跨会话记忆的核心基础设施。
+
+---
+
+## 补充模块 S5：Session Storage 会话持久化
+
+**原始路径**：`src/utils/sessionStorage.ts`（~5,106 行）
+
+### 功能概述
+
+会话持久化系统负责将完整的对话历史序列化到磁盘，支持会话恢复：
+
+- **存储路径**：`~/.claude/sessions/<session_id>.json`（或 `.jsonl`）
+- **格式**：每行一个 JSON 对象（JSONL 格式），流式追加写入
+- **内容**：完整消息历史 + 元数据（token 用量、成本、工具调用结果）
+
+### 关键功能
+
+```typescript
+// 核心 API（原版 sessionStorage.ts）
+async function saveSessionMessage(sessionId: string, message: Message): Promise<void>
+async function loadSession(sessionId: string): Promise<Message[]>
+async function listSessions(): Promise<SessionSummary[]>
+async function deleteSession(sessionId: string): Promise<void>
+async function getSessionPath(sessionId: string): string
+```
+
+### Python 实现设计
+
+```python
+# my-claude/utils/session_storage.py
+import json
+from pathlib import Path
+from datetime import datetime
+
+def get_sessions_dir() -> Path:
+    return Path.home() / '.claude' / 'sessions'
+
+def get_session_path(session_id: str) -> Path:
+    return get_sessions_dir() / f'{session_id}.jsonl'
+
+def save_message(session_id: str, message: dict) -> None:
+    path = get_session_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(message, ensure_ascii=False) + '\n')
+
+def load_session(session_id: str) -> list[dict]:
+    path = get_session_path(session_id)
+    if not path.exists():
+        return []
+    messages = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                messages.append(json.loads(line))
+    return messages
+
+def list_sessions() -> list[dict]:
+    sessions_dir = get_sessions_dir()
+    if not sessions_dir.exists():
+        return []
+    result = []
+    for p in sorted(sessions_dir.glob('*.jsonl'), key=lambda x: x.stat().st_mtime, reverse=True):
+        stat = p.stat()
+        result.append({
+            'session_id': p.stem,
+            'path': str(p),
+            'size': stat.st_size,
+            'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        })
+    return result
+```
+
+**实施阶段**：Phase G（Bootstrap State）时同步实现，用于支持 `--resume` 会话恢复功能。
+
+
+---
+
+## 补充模块 S6：Swarm 多 Agent 协调系统
+
+**原始路径**：`src/utils/swarm/`（~7,548 行）
+
+### 核心概念
+
+Swarm 是基于 tmux 的多 Claude 实例协调系统，允许一个 team-lead 实例控制多个 teammate 实例并行工作：
+
+- **team-lead**：协调者，分配任务给各 teammate
+- **teammate**：工作者，各自在独立 tmux pane 中运行
+- **通信**：通过 tmux 的 send-keys 机制传递消息
+
+### 关键常量
+
+```typescript
+// src/utils/swarm/constants.ts
+const TEAM_LEAD_NAME = 'team-lead'
+const SWARM_SESSION_NAME = 'claude-swarm'
+const SWARM_VIEW_WINDOW_NAME = 'swarm-view'
+const TMUX_COMMAND = 'tmux'
+const HIDDEN_SESSION_NAME = 'claude-hidden'
+
+// 环境变量
+const TEAMMATE_COMMAND_ENV_VAR = 'CLAUDE_CODE_TEAMMATE_COMMAND'
+const TEAMMATE_COLOR_ENV_VAR = 'CLAUDE_CODE_AGENT_COLOR'
+const PLAN_MODE_REQUIRED_ENV_VAR = 'CLAUDE_CODE_PLAN_MODE_REQUIRED'
+
+function getSwarmSocketName(): string {
+  return `claude-swarm-${process.pid}`  // 每个进程独立 socket
+}
+```
+
+### 模块组成
+
+| 文件 | 功能 |
+|------|------|
+| `constants.ts` | Swarm 常量和环境变量 |
+| `backends/` | 后端实现（local tmux、remote 等）|
+| `inProcessRunner.ts` | 进程内运行器（InProcessTeammateTask）|
+| `leaderPermissionBridge.ts` | team-lead 权限桥接 |
+| `permissionSync.ts` | 权限同步机制 |
+| `reconnection.ts` | 断线重连逻辑 |
+| `spawnInProcess.ts` | 进程内 spawn |
+| `spawnUtils.ts` | spawn 工具函数 |
+| `teamHelpers.ts` | 团队辅助函数 |
+| `teammateInit.ts` | teammate 初始化 |
+| `teammateLayoutManager.ts` | tmux 布局管理 |
+| `teammateModel.ts` | teammate 状态模型 |
+| `teammatePromptAddendum.ts` | teammate 提示词附录 |
+| `It2SetupPrompt.tsx` | iTerm2 配置提示 |
+
+### Python 实现设计（简化版）
+
+```python
+# my-claude/utils/swarm/manager.py
+import subprocess
+import os
+from dataclasses import dataclass
+
+TEAM_LEAD_NAME = 'team-lead'
+SWARM_SESSION_NAME = 'claude-swarm'
+TEAMMATE_COLOR_ENV_VAR = 'CLAUDE_CODE_AGENT_COLOR'
+PLAN_MODE_REQUIRED_ENV_VAR = 'CLAUDE_CODE_PLAN_MODE_REQUIRED'
+
+# 预设颜色（每个 teammate 一种）
+TEAMMATE_COLORS = ['blue', 'green', 'yellow', 'magenta', 'cyan', 'red']
+
+@dataclass
+class TeammateConfig:
+    name: str
+    color: str
+    plan_mode_required: bool = False
+    prompt: str = ''
+    worktree: str | None = None
+
+class SwarmManager:
+    """
+    基于 tmux 的 Swarm 协调器（简化实现）。
+    完整实现需要 tmux 进程管理 + send-keys 通信。
+    """
+    def __init__(self, session_name: str = SWARM_SESSION_NAME):
+        self.session_name = session_name
+        self.teammates: dict[str, TeammateConfig] = {}
+    
+    def _tmux(self, *args: str) -> str:
+        result = subprocess.run(
+            ['tmux', *args],
+            capture_output=True, text=True
+        )
+        return result.stdout.strip()
+    
+    def create_session(self) -> None:
+        self._tmux('new-session', '-d', '-s', self.session_name)
+    
+    def spawn_teammate(self, config: TeammateConfig) -> None:
+        env = {**os.environ, TEAMMATE_COLOR_ENV_VAR: config.color}
+        if config.plan_mode_required:
+            env[PLAN_MODE_REQUIRED_ENV_VAR] = 'true'
+        # 创建新 pane 并启动 Claude
+        self._tmux('split-window', '-t', self.session_name, '-h')
+        self.teammates[config.name] = config
+    
+    def send_to_teammate(self, name: str, message: str) -> None:
+        # 通过 tmux send-keys 发送消息
+        self._tmux('send-keys', '-t', f'{self.session_name}:{name}', message, 'Enter')
+    
+    def is_swarm_available(self) -> bool:
+        try:
+            subprocess.run(['tmux', '-V'], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+```
+
+**实施阶段**：Phase K（多 Agent 协调）的扩展部分，依赖 InProcessTeammateTask 先完成。注意：原版 Swarm 使用 tmux，Python 版本可以基于 asyncio 子进程实现更简洁的替代方案。
+
+---
+
+## 补充模块 S7：Bridge IDE 集成
+
+**原始路径**：`src/bridge/`（~12,622 行）
+
+### 功能概述
+
+Bridge 是 Claude Code 与 IDE（VSCode、JetBrains）的通信层，支持：
+- 远程会话管理（通过 Bridge API）
+- JWT token 刷新调度
+- 会话 spawn/kill/poll
+- 可信设备认证
+- 容量感知唤醒（capacityWake）
+
+### 关键模块
+
+| 文件 | 功能 |
+|------|------|
+| `bridgeMain.ts` | Bridge 主循环，会话生命周期管理 |
+| `bridgeApi.ts` | Bridge API 客户端（HTTP）|
+| `bridgeUI.ts` | Bridge 日志/UI 适配器 |
+| `bridgeStatusUtil.ts` | 状态格式化工具 |
+| `capacityWake.ts` | 容量感知唤醒（server busy 时重试）|
+| `debugUtils.ts` | 调试工具（Axios 错误描述）|
+| `jwtUtils.ts` | JWT token 刷新调度器 |
+| `pollConfig.ts` | 轮询间隔配置 |
+| `sessionIdCompat.ts` | 会话 ID 格式兼容性转换 |
+| `sessionRunner.ts` | 会话 spawn 实现 |
+| `trustedDevice.ts` | 可信设备 token 管理 |
+| `types.ts` | Bridge 类型定义 |
+
+### Python 实现优先级
+
+Bridge 是 IDE 集成功能，纯 CLI 版本的 Python 重写可以**跳过**此模块。如需实现 VSCode 扩展集成，参考原版 API 协议即可。
+
+**实施阶段**：可选 Phase M（IDE 集成），不影响核心功能。
+
+
+---
+
+## 补充模块 S8：OAuth 2.0 认证
+
+**原始路径**：`src/services/oauth/`（~1,077 行）
+
+### 功能概述
+
+OAuth 2.0 认证流程，用于通过浏览器登录 Anthropic 账户：
+
+### 关键文件
+
+| 文件 | 功能 |
+|------|------|
+| `index.ts` | OAuth 主入口，发起授权流程 |
+| `client.ts` | OAuth HTTP 客户端 |
+| `auth-code-listener.ts` | 本地 HTTP 服务器，监听授权码回调 |
+| `crypto.ts` | PKCE 加密工具（code_verifier/challenge）|
+| `types.ts` | OAuth 类型定义 |
+| `getOauthProfile.ts` | 获取用户 profile 信息 |
+
+### PKCE 流程
+
+```
+1. 生成 code_verifier (随机 32 字节 base64url)
+2. 计算 code_challenge = SHA256(code_verifier) base64url
+3. 启动本地 HTTP server 监听 redirect_uri（如 http://localhost:8080/callback）
+4. 打开浏览器：{auth_url}?response_type=code&client_id=...&code_challenge=...
+5. 用户授权后，浏览器回调到本地 server，携带 authorization_code
+6. 用 code + code_verifier 换取 access_token + refresh_token
+7. 保存 token 到 ~/.claude/credentials.json
+```
+
+### Python 实现设计
+
+```python
+# my-claude/services/oauth.py
+import hashlib, secrets, base64, json
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlencode, parse_qs, urlparse
+
+CREDENTIALS_PATH = Path.home() / '.claude' / 'credentials.json'
+
+def generate_pkce() -> tuple[str, str]:
+    """返回 (code_verifier, code_challenge)。"""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b'=').decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b'=').decode()
+    return verifier, challenge
+
+def save_credentials(token_data: dict) -> None:
+    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CREDENTIALS_PATH.write_text(json.dumps(token_data, indent=2))
+    CREDENTIALS_PATH.chmod(0o600)
+
+def load_credentials() -> dict | None:
+    if CREDENTIALS_PATH.exists():
+        return json.loads(CREDENTIALS_PATH.read_text())
+    return None
+```
+
+**实施阶段**：Phase F（配置系统）时实现凭证加载，完整 OAuth 流程可作为可选 Phase M 实现。
+
+---
+
+## 补充模块 S9：消息格式化核心
+
+**原始路径**：`src/utils/messages.ts`（~5,556 行）
+
+### 功能概述
+
+消息格式化是 Claude Code 的核心基础设施，处理所有消息类型的序列化、转换和展示：
+
+### 主要功能
+
+1. **API 消息构造**：将内部消息格式转换为 Anthropic API 格式
+2. **消息规范化**：处理 tool_use、tool_result、text 等内容块
+3. **Token 估算**：`roughTokenCountEstimation(text: string): number` — 用 `text.length / 4` 粗估 token 数
+4. **消息截断**：超出上下文窗口时截断旧消息
+5. **内容块合并**：将连续的相同类型内容块合并
+
+### 关键函数
+
+```typescript
+// 原版核心函数（messages.ts）
+function getTokenCountFromMessages(messages: Message[]): number
+function truncateMessages(messages: Message[], maxTokens: number): Message[]
+function normalizeMessages(messages: Message[]): Message[]  
+function roughTokenCountEstimation(text: string): number
+  // 实现：return Math.ceil(text.length / 4)
+
+// 消息类型转换
+function userMessageToApiFormat(msg: UserMessage): APIUserMessage
+function assistantMessageToApiFormat(msg: AssistantMessage): APIAssistantMessage
+```
+
+### Python 实现设计
+
+```python
+# my-claude/utils/messages.py
+import math
+from typing import Any
+
+def rough_token_count(text: str) -> int:
+    """粗略估算 token 数，使用 length/4 近似。"""
+    return math.ceil(len(text) / 4)
+
+def normalize_messages(messages: list[dict]) -> list[dict]:
+    """规范化消息列表，合并连续相同角色的消息。"""
+    if not messages:
+        return []
+    result = []
+    for msg in messages:
+        if result and result[-1]['role'] == msg['role']:
+            # 合并内容
+            prev = result[-1]
+            if isinstance(prev['content'], str):
+                prev['content'] = [{'type': 'text', 'text': prev['content']}]
+            if isinstance(msg['content'], str):
+                extra = [{'type': 'text', 'text': msg['content']}]
+            else:
+                extra = msg['content']
+            prev['content'].extend(extra)
+        else:
+            result.append(dict(msg))
+    return result
+
+def get_message_token_count(messages: list[dict]) -> int:
+    """估算消息列表总 token 数。"""
+    total = 0
+    for msg in messages:
+        content = msg.get('content', '')
+        if isinstance(content, str):
+            total += rough_token_count(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total += rough_token_count(str(block.get('text', '') or block.get('input', '')))
+    return total
+
+def truncate_messages(messages: list[dict], max_tokens: int) -> list[dict]:
+    """从最旧的消息开始删除，直到总 token 数在限制内。"""
+    while messages and get_message_token_count(messages) > max_tokens:
+        messages = messages[1:]  # 删除最旧消息
+    return messages
+```
+
+**实施阶段**：Phase A 完成后即可实现（已在 core/query.py 中有基础版本），Phase E（压缩策略）时需要完整版本。
+
+---
+
+## 补充模块 S10：附件系统
+
+**原始路径**：`src/utils/attachments.ts`（~3,999 行）
+
+### 功能概述
+
+附件系统处理用户粘贴或拖拽的文件内容，支持：
+- **图片**：base64 编码后作为 image content block 发送
+- **文本文件**：直接嵌入为 text content block
+- **PDF**：base64 编码（API 支持直接处理 PDF）
+
+### Python 实现设计
+
+```python
+# my-claude/utils/attachments.py
+import base64, mimetypes
+from pathlib import Path
+
+SUPPORTED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+SUPPORTED_DOC_TYPES = {'application/pdf'}
+
+def file_to_content_block(path: Path) -> dict:
+    """将文件转换为 Anthropic API content block。"""
+    mime, _ = mimetypes.guess_type(str(path))
+    data = path.read_bytes()
+    
+    if mime in SUPPORTED_IMAGE_TYPES:
+        return {
+            'type': 'image',
+            'source': {
+                'type': 'base64',
+                'media_type': mime,
+                'data': base64.standard_b64encode(data).decode(),
+            }
+        }
+    elif mime in SUPPORTED_DOC_TYPES:
+        return {
+            'type': 'document',
+            'source': {
+                'type': 'base64',
+                'media_type': mime,
+                'data': base64.standard_b64encode(data).decode(),
+            }
+        }
+    else:
+        # 文本文件
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            text = data.decode('latin-1')
+        return {'type': 'text', 'text': f'<file path="{path.name}">\n{text}\n</file>'}
+```
+
+**实施阶段**：Phase L（TUI）时实现，用于支持文件拖拽和粘贴功能。
+
+
+---
+
+## 补充模块 S11：消息格式化与打印模式
+
+**原始路径**：`src/cli/print.ts`（~5,604 行）
+
+### 功能概述
+
+`print.ts` 是非交互式（SDK/pipe）模式的输出处理器，与 REPL 的 React/Ink 组件平行：
+
+- **pipe 模式**（`echo "..." | claude -p`）：流式输出到 stdout
+- **SDK 模式**：程序化调用时的输出格式
+- **JSON 输出**（`--output-format json`）：结构化 JSON 输出
+- **stream-JSON 输出**：每个事件一行 JSON
+
+### 输出格式
+
+```bash
+# text 格式（默认）
+$ echo "hello" | claude -p
+Hello! How can I help you?
+
+# json 格式
+$ echo "hello" | claude -p --output-format json
+{"type":"result","subtype":"success","result":"Hello!","session_id":"...","cost_usd":0.001}
+
+# stream-json 格式
+$ echo "hello" | claude -p --output-format stream-json
+{"type":"assistant","message":{"role":"assistant","content":[...]}}
+{"type":"result","subtype":"success","result":"..."}
+```
+
+### Python 实现设计
+
+```python
+# my-claude/cli/print_mode.py
+import json, sys
+from dataclasses import dataclass
+from typing import Literal
+
+OutputFormat = Literal['text', 'json', 'stream-json']
+
+@dataclass
+class PrintModeConfig:
+    output_format: OutputFormat = 'text'
+    verbose: bool = False
+    max_turns: int = 10
+
+class PrintModeOutput:
+    def __init__(self, config: PrintModeConfig):
+        self.config = config
+        self._text_buffer = []
+    
+    def on_text_delta(self, text: str) -> None:
+        if self.config.output_format == 'text':
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        elif self.config.output_format == 'stream-json':
+            print(json.dumps({'type': 'text_delta', 'text': text}))
+    
+    def on_turn_complete(self, message: dict) -> None:
+        if self.config.output_format == 'stream-json':
+            print(json.dumps({'type': 'assistant', 'message': message}))
+    
+    def on_done(self, result_text: str, session_id: str, cost_usd: float) -> None:
+        if self.config.output_format == 'text':
+            pass  # 已经流式输出
+        elif self.config.output_format == 'json':
+            print(json.dumps({
+                'type': 'result',
+                'subtype': 'success',
+                'result': result_text,
+                'session_id': session_id,
+                'cost_usd': cost_usd,
+            }))
+        elif self.config.output_format == 'stream-json':
+            print(json.dumps({
+                'type': 'result',
+                'subtype': 'success',
+                'result': result_text,
+                'session_id': session_id,
+                'cost_usd': cost_usd,
+            }))
+```
+
+**实施阶段**：Phase A 完成后可立即实现，是 pipe 模式的核心输出层。
+
+---
+
+## 补充模块 S12：更新后的实施路线图
+
+在原有 A-L 12 个阶段基础上，补充以下阶段：
+
+### 完整路线图（修订版）
+
+| 阶段 | 模块 | 状态 | 关键文件 | 原版参考 | 优先级 |
+|------|------|------|---------|---------|--------|
+| A | SSE 流式输出 + httpx 客户端 | ✅ 已完成 | core/ | claude.ts | 核心 |
+| B | Hook 系统（27事件/4类型）| 待实现 | services/hooks.py | hooks.ts | 高 |
+| C | 权限规则引擎 | 待实现 | permissions/rule_engine.py | permissions/*.ts | 高 |
+| D | 工具基类重构 + Bash AST | 待实现 | tools/base.py, utils/bash_analysis.py | Tool.ts, utils/bash/ | 高 |
+| E | 压缩策略扩展（micro+降级链）| 待实现 | services/compact_v2.py | compact/*.ts | 高 |
+| F | 配置系统（GlobalConfig+Settings+Skills）| 待实现 | config_system/, skills/ | config.ts + settings/ + skills/ | 高 |
+| G | Bootstrap State + Session Storage + Session Memory | 待实现 | bootstrap/state.py, session_storage.py, session_memory.py | bootstrap/state.ts | 高 |
+| H | Buddy 系统 | 待实现 | buddy/ | buddy/ | 低 |
+| I | asyncio 并发工具执行 | 待实现 | core/tool_orchestrator.py | StreamingToolExecutor.ts | 高 |
+| J | MCP 协议 | 待实现 | services/mcp/ | services/mcp/ | 中 |
+| K | 多 Agent 协调 + Tasks | 待实现 | tools/agent_tool.py, tasks/ | AgentTool/, tasks/ | 中 |
+| L | Textual TUI + 附件 + 打印模式 | 可选 | ui/app.py, cli/print_mode.py | REPL.tsx + cli/print.ts | 中 |
+| M | 消息格式化核心（messages.py）| 待实现 | utils/messages.py | utils/messages.ts | 高 |
+| N | Swarm 多 Agent 协调 | 可选 | utils/swarm/ | utils/swarm/ | 低 |
+| O | OAuth 认证 | 可选 | services/oauth.py | services/oauth/ | 低 |
+| P | IDE Bridge 集成 | 可选 | bridge/ | bridge/ | 低 |
+
+### 实际最小可行版本（MVP）所需阶段
+
+按优先级排序，实现完整 CLI 功能最少需要：
+
+1. **A**（已完成）→ **M**（消息格式化）→ **G**（状态+存储）→ **F**（配置）
+2. → **C**（权限）→ **D**（工具基类+Bash AST）→ **B**（Hook）
+3. → **I**（并发执行）→ **E**（压缩）→ **L**（TUI 或 print 模式）
+
+其余阶段（H/J/K/N/O/P）为可选增强功能。
+
+---
+
+## 模块覆盖完成度总结
+
+| 类别 | 原版代码量 | 本计划覆盖 | 完成度 |
+|------|-----------|-----------|--------|
+| 核心 API + 流式 | ~3,000 行 | A 阶段 | ✅ 100% |
+| 工具系统（56个工具）| ~51,000 行 | D 阶段 | 规划完整 |
+| Hook 系统 | ~5,121 行 | B 阶段 | 规划完整 |
+| 权限系统 | ~3,000 行 | C 阶段 | 规划完整 |
+| 压缩系统 | ~8,000 行 | E 阶段 | 规划完整（snip为stub）|
+| 配置+Settings | ~10,000 行 | F 阶段 | 规划完整 |
+| Bootstrap State | ~2,000 行 | G 阶段 | 规划完整 |
+| Session Storage | ~5,106 行 | G/S5 阶段 | 规划完整 |
+| Session Memory | ~1,026 行 | G/S4 阶段 | 规划完整 |
+| Bash AST 安全分析 | ~12,310 行 | D/S1 阶段 | 规划完整 |
+| Skills 技能系统 | ~4,080 行 | F/S3 阶段 | 规划完整 |
+| Tasks 任务系统 | ~3,317 行 | K/S2 阶段 | 规划完整 |
+| MCP 协议 | ~6,000 行 | J 阶段 | 规划完整 |
+| 多 Agent/AgentTool | ~8,000 行 | K 阶段 | 规划完整 |
+| Swarm 协调 | ~7,548 行 | N/S6 阶段 | 规划（可选）|
+| Bridge IDE 集成 | ~12,622 行 | P/S7 阶段 | 规划（可选）|
+| Buddy 系统 | ~3,000 行 | H 阶段 | 规划完整 |
+| TUI/UI 层 | ~82,000 行 | L 阶段 | 规划（简化）|
+| 消息格式化 | ~5,556 行 | M/S9 阶段 | 规划完整 |
+| OAuth 认证 | ~1,077 行 | O/S8 阶段 | 规划（可选）|
+| 附件系统 | ~3,999 行 | L/S10 阶段 | 规划完整 |
+| CLI/打印模式 | ~5,604 行 | L/S11 阶段 | 规划完整 |
+| **总计** | **~150,000 行** | **全部覆盖** | **规划完成** |
+
